@@ -44,8 +44,10 @@ type AppendEntriesArgs struct {
 	LeaderCommit                              int
 }
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictTerm  int
+	ConflictIndex int
 }
 type ApplyMsg struct {
 	CommandValid bool
@@ -205,11 +207,26 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	rf.becomeFollowerLocked(args.Term)
 	rf.resetElectionTimerLocked()
 
-	if args.PrevLogIndex < 0 || args.PrevLogIndex >= len(rf.logs) {
+	if args.PrevLogIndex < 0 {
+		return
+	}
+
+	if args.PrevLogIndex >= len(rf.logs) {
+		reply.ConflictIndex = len(rf.logs)
+		reply.ConflictTerm = -1
 		return
 	}
 
 	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		index := args.PrevLogIndex
+		term := rf.logs[args.PrevLogIndex].Term
+
+		for index > 0 && term == rf.logs[index-1].Term {
+			index--
+		}
+
+		reply.ConflictTerm = term
+		reply.ConflictIndex = index
 		return
 	}
 
@@ -411,12 +428,17 @@ func (rf *Raft) replicateToPeer(server int) {
 		return
 	}
 
-	next = rf.nextIndex[server] - 1
-	if next < 1 {
-		next = 1
+	next = reply.ConflictIndex
+	if reply.ConflictTerm != -1 {
+		for i := len(rf.logs) - 1; i >= 1; i-- {
+			if rf.logs[i].Term == reply.ConflictTerm {
+				next = i + 1
+				break
+			}
+		}
 	}
 
-	rf.nextIndex[server] = next
+	rf.nextIndex[server] = max(1, next)
 	rf.mu.Unlock()
 }
 
