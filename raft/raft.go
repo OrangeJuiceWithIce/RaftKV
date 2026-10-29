@@ -83,7 +83,8 @@ type Raft struct {
 	applyCh   chan ApplyMsg
 	applyCond *sync.Cond
 
-	stopCh chan struct{}
+	replicatedConds []*sync.Cond
+	stopCh          chan struct{}
 }
 
 func NewRaft(me int, peers []*PeerClient, applyCh chan ApplyMsg) (*Raft, error) {
@@ -102,18 +103,28 @@ func NewRaft(me int, peers []*PeerClient, applyCh chan ApplyMsg) (*Raft, error) 
 	}
 
 	rf := &Raft{
-		me:         me,
-		peers:      peers,
-		votedFor:   -1,
-		logs:       []LogEntry{{Term: 0}},
-		state:      Follower,
-		nextIndex:  make([]int, len(peers)),
-		matchIndex: make([]int, len(peers)),
-		applyCh:    applyCh,
-		stopCh:     make(chan struct{}),
+		me:              me,
+		peers:           peers,
+		votedFor:        -1,
+		logs:            []LogEntry{{Term: 0}},
+		state:           Follower,
+		nextIndex:       make([]int, len(peers)),
+		matchIndex:      make([]int, len(peers)),
+		applyCh:         applyCh,
+		stopCh:          make(chan struct{}),
+		replicatedConds: make([]*sync.Cond, n),
 	}
 	rf.applyCond = sync.NewCond(&rf.mu)
 	rf.resetElectionTimerLocked()
+
+	for peer := range peers {
+		if peer == rf.me {
+			continue
+		}
+
+		rf.replicatedConds[peer] = sync.NewCond(&rf.mu)
+		go rf.replicator(peer)
+	}
 
 	go rf.ticker()
 	go rf.applier()
@@ -345,35 +356,56 @@ func (rf *Raft) becomeLeaderLocked() {
 	if rf.state != Candidate {
 		return
 	}
+
 	rf.state = Leader
 	last, _ := rf.lastLogInfoLocked()
 	for id := range rf.peers {
 		rf.nextIndex[id] = last + 1
 		rf.matchIndex[id] = 0
 	}
+
 	rf.nextIndex[rf.me] = last + 1
 	rf.matchIndex[rf.me] = last
+
+	rf.signalReplicatorsLocked()
 	rf.lastHeartbeat = time.Now()
-	go rf.broadcastAppendEntries()
+	go rf.broadcastHeartbeat()
 }
 
-func (rf *Raft) broadcastAppendEntries() {
-	for id := range rf.peers {
-		if id == rf.me {
+// replicate
+func (rf *Raft) needReplicating(peer int) bool {
+	return rf.state == Leader &&
+		rf.matchIndex[peer] < len(rf.logs)-1
+}
+
+func (rf *Raft) signalReplicatorsLocked() {
+	for peer, cond := range rf.replicatedConds {
+		if peer == rf.me {
 			continue
 		}
-		go rf.replicateToPeer(id)
+
+		cond.Signal()
 	}
 }
 
-func (rf *Raft) replicateToPeer(server int) {
+func (rf *Raft) replicator(peer int) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	if rf.killed() || rf.state != Leader {
-		rf.mu.Unlock()
-		return
+	for !rf.killed() {
+		for !rf.killed() && !rf.needReplicating(peer) {
+			rf.replicatedConds[peer].Wait()
+		}
+
+		if rf.killed() {
+			return
+		}
+
+		rf.replicateOneRoundLocked(peer)
 	}
+}
 
+func (rf *Raft) replicateOneRoundLocked(server int) {
 	term := rf.currentTerm
 	next := rf.nextIndex[server]
 	prev := next - 1
@@ -390,20 +422,27 @@ func (rf *Raft) replicateToPeer(server int) {
 	rf.mu.Unlock()
 
 	var reply AppendEntriesReply
-	if !rf.SendAppendEntries(server, &args, &reply) {
-		return
+
+	ok := rf.SendAppendEntries(server, &args, &reply)
+	if !ok {
+		select {
+		case <-time.After(heartbeatInterval):
+		case <-rf.stopCh:
+		}
 	}
 
 	rf.mu.Lock()
 
+	if !ok {
+		return
+	}
+
 	if reply.Term > rf.currentTerm {
 		rf.becomeFollowerLocked(reply.Term)
-		rf.mu.Unlock()
 		return
 	}
 
 	if rf.killed() || rf.state != Leader || rf.currentTerm != term {
-		rf.mu.Unlock()
 		return
 	}
 
@@ -419,14 +458,12 @@ func (rf *Raft) replicateToPeer(server int) {
 		}
 		rf.updateCommitIndexLocked()
 
-		rf.mu.Unlock()
 		return
 	}
 
-	if args.PrevLogIndex <= rf.matchIndex[server] || rf.nextIndex[server] != args.PrevLogIndex+1 {
-		rf.mu.Unlock()
-		return
-	}
+	// if args.PrevLogIndex <= rf.matchIndex[server] || rf.nextIndex[server] != args.PrevLogIndex+1 {
+	// 	return
+	// }
 
 	next = reply.ConflictIndex
 	if reply.ConflictTerm != -1 {
@@ -439,7 +476,53 @@ func (rf *Raft) replicateToPeer(server int) {
 	}
 
 	rf.nextIndex[server] = max(1, next)
+}
+
+// heartbeat
+func (rf *Raft) broadcastHeartbeat() {
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+
+		go rf.sendHeartbeat(peer)
+	}
+}
+
+func (rf *Raft) sendHeartbeat(peer int) {
+	rf.mu.Lock()
+
+	if rf.killed() || rf.state != Leader {
+		rf.mu.Unlock()
+		return
+	}
+
+	term := rf.currentTerm
+	matched := rf.matchIndex[peer]
+
+	args := AppendEntriesArgs{
+		Term:         term,
+		LeaderId:     rf.me,
+		PrevLogIndex: matched,
+		PrevLogTerm:  rf.logs[matched].Term,
+		Entries:      nil,
+		LeaderCommit: rf.commitIndex,
+	}
+
 	rf.mu.Unlock()
+
+	var reply AppendEntriesReply
+	if !rf.SendAppendEntries(peer, &args, &reply) {
+		return
+	}
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if reply.Term > rf.currentTerm {
+		rf.becomeFollowerLocked(reply.Term)
+		return
+	}
 }
 
 func (rf *Raft) updateCommitIndexLocked() {
@@ -486,7 +569,8 @@ func (rf *Raft) ticker() {
 			if now.Sub(rf.lastHeartbeat) >= heartbeatInterval {
 				rf.lastHeartbeat = now
 				rf.mu.Unlock()
-				rf.broadcastAppendEntries()
+
+				rf.broadcastHeartbeat()
 				continue
 			}
 		} else if !now.Before(rf.electionDeadline) {
@@ -545,9 +629,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.nextIndex[rf.me] = index + 1
 
 	rf.updateCommitIndexLocked()
+	rf.signalReplicatorsLocked()
 	rf.mu.Unlock()
 
-	go rf.broadcastAppendEntries()
 	return index, term, true
 }
 
@@ -555,7 +639,15 @@ func (rf *Raft) Kill() {
 	if atomic.CompareAndSwapInt32(&rf.dead, 0, 1) {
 		close(rf.stopCh)
 		rf.mu.Lock()
+
 		rf.applyCond.Broadcast()
+
+		for peer, cond := range rf.replicatedConds {
+			if peer != rf.me && cond != nil {
+				cond.Broadcast()
+			}
+		}
+
 		rf.mu.Unlock()
 	}
 }
