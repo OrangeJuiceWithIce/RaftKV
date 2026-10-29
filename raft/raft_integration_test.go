@@ -5,6 +5,8 @@ import (
 	"encoding/gob"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -125,6 +127,7 @@ type testCluster struct {
 	clients [][]*PeerClient
 
 	record []*applyRecorder
+	paths  []string
 	stop   chan struct{}
 }
 
@@ -138,6 +141,7 @@ func newTestCluster(t *testing.T, n int) *testCluster {
 		servers: make([]*grpc.Server, n),
 		clients: make([][]*PeerClient, n),
 		record:  make([]*applyRecorder, n),
+		paths:   make([]string, n),
 		stop:    make(chan struct{}),
 	}
 
@@ -186,6 +190,12 @@ func newTestCluster(t *testing.T, n int) *testCluster {
 		}
 	})
 
+	// 为每个节点分配独立的磁盘状态路径，避免测试之间相互影响。
+	stateDir := t.TempDir()
+	for i := 0; i < n; i++ {
+		c.paths[i] = filepath.Join(stateDir, fmt.Sprintf("node-%d", i), "state.gob")
+	}
+
 	// 创建每个节点的 PeerClient、Raft 和 gRPC Server。
 	for i := 0; i < n; i++ {
 		c.clients[i] = make([]*PeerClient, n)
@@ -220,11 +230,11 @@ func newTestCluster(t *testing.T, n int) *testCluster {
 			}
 		}()
 
-		rf, err := NewRaft(
-			i,
-			c.clients[i],
-			applyCh,
-		)
+		ps, err := NewPersister(c.paths[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		rf, err := NewRaft(i, c.clients[i], applyCh, ps)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -653,3 +663,171 @@ func TestRaftConcurrentStart(t *testing.T) {
 
 // 编译时检查测试 RPC Server 实现了对应接口。
 var _ pb.RaftServiceServer = (*testRPCServer)(nil)
+
+// ---------- Test 7-11: Disk persistence / restart ----------
+
+// 从同一个磁盘路径重建 Raft；使用单节点避免修改已有的 gRPC 集群生命周期。
+// 测试直接调用 RPC Handler，因此不依赖真实的网络连接。
+func newDiskNodeForIntegration(t *testing.T, path string) *Raft {
+	t.Helper()
+	ps, err := NewPersister(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rf, err := NewRaft(0, []*PeerClient{nil}, make(chan ApplyMsg, 128), ps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(rf.Kill)
+	return rf
+}
+
+func TestRaftDiskVoteSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "node0", "state.gob")
+	rf := newDiskNodeForIntegration(t, path)
+
+	var first RequestVoteReply
+	rf.HandleRequestVote(&RequestVoteArgs{
+		Term: 12, CandidateId: 1, LastLogIndex: 0, LastLogTerm: 0,
+	}, &first)
+	if !first.VoteGranted || first.Term != 12 {
+		t.Fatalf("initial vote: %+v", first)
+	}
+	rf.Kill()
+
+	restarted := newDiskNodeForIntegration(t, path)
+	restarted.mu.Lock()
+	term, voted, role := restarted.currentTerm, restarted.votedFor, restarted.state
+	restarted.mu.Unlock()
+	if term != 12 || voted != 1 || role != Follower {
+		t.Fatalf("recovered term=%d vote=%d role=%v; want term=12 vote=1 follower", term, voted, role)
+	}
+
+	var again RequestVoteReply
+	restarted.HandleRequestVote(&RequestVoteArgs{
+		Term: 12, CandidateId: 2, LastLogIndex: 0, LastLogTerm: 0,
+	}, &again)
+	if again.VoteGranted {
+		t.Fatalf("double voting in the same term after restart: %+v", again)
+	}
+}
+
+func TestRaftDiskHigherTermOnRejectedAppend(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "node0", "state.gob")
+	rf := newDiskNodeForIntegration(t, path)
+	var reply AppendEntriesReply
+	rf.HandleAppendEntries(&AppendEntriesArgs{
+		Term: 17, LeaderId: 1, PrevLogIndex: 99, PrevLogTerm: 17,
+	}, &reply)
+	if reply.Success || reply.Term != 17 {
+		t.Fatalf("expected rejection with updated term: %+v", reply)
+	}
+	rf.Kill()
+
+	restarted := newDiskNodeForIntegration(t, path)
+	term, _ := restarted.GetState()
+	if term != 17 {
+		t.Fatalf("term lost after rejected append: got %d want 17", term)
+	}
+}
+
+func TestRaftDiskConflictOverwriteSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "node0", "state.gob")
+	rf := newDiskNodeForIntegration(t, path)
+
+	var reply AppendEntriesReply
+	rf.HandleAppendEntries(&AppendEntriesArgs{
+		Term: 3, LeaderId: 1, PrevLogIndex: 0, PrevLogTerm: 0,
+		Entries: []LogEntry{
+			{Term: 3, Command: "old-1"},
+			{Term: 3, Command: "old-2"},
+		},
+	}, &reply)
+	if !reply.Success {
+		t.Fatalf("initial append rejected: %+v", reply)
+	}
+	rf.Kill()
+
+	rf2 := newDiskNodeForIntegration(t, path)
+	if got := rf2.GetLogs(); len(got) != 3 || got[2].Command != "old-2" {
+		t.Fatalf("initial logs not recovered: %#v", got)
+	}
+
+	reply = AppendEntriesReply{}
+	rf2.HandleAppendEntries(&AppendEntriesArgs{
+		Term: 4, LeaderId: 2, PrevLogIndex: 0, PrevLogTerm: 0,
+		Entries: []LogEntry{
+			{Term: 4, Command: "new-1"},
+			{Term: 4, Command: "new-2"},
+		},
+	}, &reply)
+	if !reply.Success {
+		t.Fatalf("conflict overwrite rejected: %+v", reply)
+	}
+	rf2.Kill()
+
+	rf3 := newDiskNodeForIntegration(t, path)
+	want := []LogEntry{
+		{Term: 0},
+		{Term: 4, Command: "new-1"},
+		{Term: 4, Command: "new-2"},
+	}
+	if got := rf3.GetLogs(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("logs after restart: got %#v, want %#v", got, want)
+	}
+}
+
+// 在现有三节点 gRPC 集群上验证：Start 返回时已持久化，
+// Follower 追赶完成后，磁盘上也存在相同的命令。
+func TestRaftDiskAgreementDurable(t *testing.T) {
+	c := newTestCluster(t, 3)
+	command := testOp{Kind: "Put", Key: "persist", Value: "value"}
+	leader, index := c.start(command)
+
+	// Start 返回后，无需停止节点即可从磁盘读取其状态。
+	ps, err := NewPersister(c.paths[leader])
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe := &Raft{persister: ps, votedFor: -1, logs: []LogEntry{{Term: 0}}}
+	if err := probe.readPersist(); err != nil {
+		t.Fatal(err)
+	}
+	if index >= len(probe.logs) || !reflect.DeepEqual(probe.logs[index].Command, command) {
+		t.Fatalf("leader Start did not persist command at index %d: %#v", index, probe.logs)
+	}
+
+	for i := range c.rf {
+		c.waitApplied(i, index, command, 5*time.Second)
+	}
+	for i, path := range c.paths {
+		ps, err := NewPersister(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		probe := &Raft{persister: ps, votedFor: -1, logs: []LogEntry{{Term: 0}}}
+		if err := probe.readPersist(); err != nil {
+			t.Fatal(err)
+		}
+		if index >= len(probe.logs) || !reflect.DeepEqual(probe.logs[index].Command, command) {
+			t.Fatalf("node %d disk missing committed command at index %d: %#v", i, index, probe.logs)
+		}
+	}
+}
+
+func TestRaftDiskCorruptStateRejected(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "node0", "state.gob")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("invalid gob bytes"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	ps, err := NewPersister(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewRaft(0, []*PeerClient{nil}, make(chan ApplyMsg, 16), ps); err == nil {
+		t.Fatal("corrupted Raft state should produce an error")
+	}
+}

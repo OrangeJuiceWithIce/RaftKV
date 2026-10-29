@@ -1,7 +1,9 @@
 package raft
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -73,6 +75,8 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 
+	persister *Persister
+
 	commitIndex, lastApplied int
 
 	nextIndex, matchIndex []int
@@ -87,7 +91,7 @@ type Raft struct {
 	stopCh          chan struct{}
 }
 
-func NewRaft(me int, peers []*PeerClient, applyCh chan ApplyMsg) (*Raft, error) {
+func NewRaft(me int, peers []*PeerClient, applyCh chan ApplyMsg, persister *Persister) (*Raft, error) {
 	n := len(peers)
 
 	if n == 0 {
@@ -102,11 +106,16 @@ func NewRaft(me int, peers []*PeerClient, applyCh chan ApplyMsg) (*Raft, error) 
 		return nil, fmt.Errorf("nil applyCh")
 	}
 
+	if persister == nil {
+		return nil, fmt.Errorf("nil persister")
+	}
+
 	rf := &Raft{
 		me:              me,
 		peers:           peers,
 		votedFor:        -1,
 		logs:            []LogEntry{{Term: 0}},
+		persister:       persister,
 		state:           Follower,
 		nextIndex:       make([]int, len(peers)),
 		matchIndex:      make([]int, len(peers)),
@@ -115,6 +124,11 @@ func NewRaft(me int, peers []*PeerClient, applyCh chan ApplyMsg) (*Raft, error) 
 		replicatedConds: make([]*sync.Cond, n),
 	}
 	rf.applyCond = sync.NewCond(&rf.mu)
+
+	if err := rf.readPersist(); err != nil {
+		return nil, fmt.Errorf("read raft state: %w", err)
+	}
+
 	rf.resetElectionTimerLocked()
 
 	for peer := range peers {
@@ -162,6 +176,8 @@ func (rf *Raft) becomeFollowerLocked(term int) {
 	if term > rf.currentTerm {
 		rf.currentTerm = term
 		rf.votedFor = -1
+
+		rf.persistLocked()
 	}
 
 	rf.state = Follower
@@ -197,6 +213,8 @@ func (rf *Raft) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply
 
 	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.isLogUpToDateLocked(args.LastLogIndex, args.LastLogTerm) {
 		rf.votedFor = args.CandidateId
+		rf.persistLocked()
+
 		reply.VoteGranted = true
 		rf.resetElectionTimerLocked()
 	}
@@ -249,6 +267,7 @@ func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 
 	if i < len(args.Entries) {
 		rf.logs = append(rf.logs[:start+i], args.Entries[i:]...)
+		rf.persistLocked()
 	}
 
 	reply.Success = true
@@ -297,6 +316,8 @@ func (rf *Raft) startElectionLocked() {
 	rf.currentTerm++
 	rf.state = Candidate
 	rf.votedFor = rf.me
+
+	rf.persistLocked()
 
 	rf.resetElectionTimerLocked()
 
@@ -433,7 +454,7 @@ func (rf *Raft) replicateOneRoundLocked(server int) {
 
 	rf.mu.Lock()
 
-	if !ok {
+	if !ok || rf.killed() {
 		return
 	}
 
@@ -476,6 +497,33 @@ func (rf *Raft) replicateOneRoundLocked(server int) {
 	}
 
 	rf.nextIndex[server] = max(1, next)
+}
+
+func (rf *Raft) updateCommitIndexLocked() {
+	if rf.state != Leader {
+		return
+	}
+
+	majority := len(rf.peers)/2 + 1
+
+	for n := len(rf.logs) - 1; n > rf.commitIndex; n-- {
+		if rf.logs[n].Term != rf.currentTerm {
+			continue
+		}
+
+		count := 0
+		for _, matched := range rf.matchIndex {
+			if matched >= n {
+				count++
+			}
+		}
+
+		if count >= majority {
+			rf.commitIndex = n
+			rf.applyCond.Signal()
+			return
+		}
+	}
 }
 
 // heartbeat
@@ -522,33 +570,6 @@ func (rf *Raft) sendHeartbeat(peer int) {
 	if reply.Term > rf.currentTerm {
 		rf.becomeFollowerLocked(reply.Term)
 		return
-	}
-}
-
-func (rf *Raft) updateCommitIndexLocked() {
-	if rf.state != Leader {
-		return
-	}
-
-	majority := len(rf.peers)/2 + 1
-
-	for n := len(rf.logs) - 1; n > rf.commitIndex; n-- {
-		if rf.logs[n].Term != rf.currentTerm {
-			continue
-		}
-
-		count := 0
-		for _, matched := range rf.matchIndex {
-			if matched >= n {
-				count++
-			}
-		}
-
-		if count >= majority {
-			rf.commitIndex = n
-			rf.applyCond.Signal()
-			return
-		}
 	}
 }
 
@@ -623,7 +644,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	rf.logs = append(rf.logs, LogEntry{Term: term, Command: command})
-
+	rf.persistLocked()
 	index := len(rf.logs) - 1
 	rf.matchIndex[rf.me] = index
 	rf.nextIndex[rf.me] = index + 1
@@ -654,4 +675,61 @@ func (rf *Raft) Kill() {
 
 func (rf *Raft) killed() bool {
 	return atomic.LoadInt32(&rf.dead) == 1
+}
+
+// persist
+func (rf *Raft) persistLocked() {
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+
+	if err := enc.Encode(rf.currentTerm); err != nil {
+		panic(err)
+	}
+	if err := enc.Encode(rf.votedFor); err != nil {
+		panic(err)
+	}
+	if err := enc.Encode(rf.logs); err != nil {
+		panic(err)
+	}
+
+	if err := rf.persister.SaveRaftState(buf.Bytes()); err != nil {
+		panic(fmt.Errorf("persist raft state: %w", err))
+	}
+}
+
+func (rf *Raft) readPersist() error {
+	data, err := rf.persister.ReadRaftState()
+	if err != nil {
+		return err
+	}
+
+	if len(data) == 0 {
+		return nil
+	}
+
+	dec := gob.NewDecoder(bytes.NewReader(data))
+
+	var term int
+	var votedFor int
+	var logs []LogEntry
+
+	if err := dec.Decode(&term); err != nil {
+		return err
+	}
+	if err := dec.Decode(&votedFor); err != nil {
+		return err
+	}
+	if err := dec.Decode(&logs); err != nil {
+		return err
+	}
+
+	if len(logs) == 0 || logs[0].Term != 0 {
+		return fmt.Errorf("invalid persisted raft log")
+	}
+
+	rf.currentTerm = term
+	rf.votedFor = votedFor
+	rf.logs = logs
+
+	return nil
 }
