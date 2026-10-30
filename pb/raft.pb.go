@@ -143,8 +143,9 @@ func (x *RequestVoteResponse) GetVoteGranted() bool {
 
 type LogEntry struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Term          int64                  `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
-	Command       []byte                 `protobuf:"bytes,2,opt,name=command,proto3" json:"command,omitempty"`
+	Index         int64                  `protobuf:"varint,1,opt,name=index,proto3" json:"index,omitempty"`
+	Term          int64                  `protobuf:"varint,2,opt,name=term,proto3" json:"term,omitempty"`
+	Command       []byte                 `protobuf:"bytes,3,opt,name=command,proto3" json:"command,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -177,6 +178,13 @@ func (x *LogEntry) ProtoReflect() protoreflect.Message {
 // Deprecated: Use LogEntry.ProtoReflect.Descriptor instead.
 func (*LogEntry) Descriptor() ([]byte, []int) {
 	return file_proto_raft_proto_rawDescGZIP(), []int{2}
+}
+
+func (x *LogEntry) GetIndex() int64 {
+	if x != nil {
+		return x.Index
+	}
+	return 0
 }
 
 func (x *LogEntry) GetTerm() int64 {
@@ -278,12 +286,11 @@ func (x *AppendEntriesRequest) GetLeaderCommit() int64 {
 }
 
 type AppendEntriesResponse struct {
-	state   protoimpl.MessageState `protogen:"open.v1"`
-	Term    int64                  `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
-	Success bool                   `protobuf:"varint,2,opt,name=success,proto3" json:"success,omitempty"`
-	// 用于优化日志冲突回退
-	ConflictIndex int64 `protobuf:"varint,3,opt,name=conflict_index,json=conflictIndex,proto3" json:"conflict_index,omitempty"`
-	ConflictTerm  int64 `protobuf:"varint,4,opt,name=conflict_term,json=conflictTerm,proto3" json:"conflict_term,omitempty"`
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Term          int64                  `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	Success       bool                   `protobuf:"varint,2,opt,name=success,proto3" json:"success,omitempty"`
+	ConflictIndex int64                  `protobuf:"varint,3,opt,name=conflict_index,json=conflictIndex,proto3" json:"conflict_index,omitempty"`
+	ConflictTerm  int64                  `protobuf:"varint,4,opt,name=conflict_term,json=conflictTerm,proto3" json:"conflict_term,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -478,10 +485,11 @@ const file_proto_raft_proto_rawDesc = "" +
 	"\rlast_log_term\x18\x04 \x01(\x03R\vlastLogTerm\"L\n" +
 	"\x13RequestVoteResponse\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x03R\x04term\x12!\n" +
-	"\fvote_granted\x18\x02 \x01(\bR\vvoteGranted\"8\n" +
-	"\bLogEntry\x12\x12\n" +
-	"\x04term\x18\x01 \x01(\x03R\x04term\x12\x18\n" +
-	"\acommand\x18\x02 \x01(\fR\acommand\"\xe0\x01\n" +
+	"\fvote_granted\x18\x02 \x01(\bR\vvoteGranted\"N\n" +
+	"\bLogEntry\x12\x14\n" +
+	"\x05index\x18\x01 \x01(\x03R\x05index\x12\x12\n" +
+	"\x04term\x18\x02 \x01(\x03R\x04term\x12\x18\n" +
+	"\acommand\x18\x03 \x01(\fR\acommand\"\xe0\x01\n" +
 	"\x14AppendEntriesRequest\x12\x12\n" +
 	"\x04term\x18\x01 \x01(\x03R\x04term\x12\x1b\n" +
 	"\tleader_id\x18\x02 \x01(\x03R\bleaderId\x12$\n" +

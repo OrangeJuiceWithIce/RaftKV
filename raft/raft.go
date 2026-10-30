@@ -1,60 +1,21 @@
 package raft
 
 import (
-	"bytes"
-	"context"
-	"encoding/gob"
 	"fmt"
-	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-type Role int
-
-const (
-	Follower Role = iota
-	Candidate
-	Leader
-)
-
-func (r Role) String() string {
-	switch r {
-	case Follower:
-		return "Follower"
-	case Candidate:
-		return "Candidate"
-	case Leader:
-		return "Leader"
-	}
-	return "Unknown"
-}
-
-type LogEntry struct {
-	Term    int
-	Command interface{}
-}
-type RequestVoteArgs struct{ Term, CandidateId, LastLogIndex, LastLogTerm int }
-type RequestVoteReply struct {
-	Term        int
-	VoteGranted bool
-}
-type AppendEntriesArgs struct {
-	Term, LeaderId, PrevLogIndex, PrevLogTerm int
-	Entries                                   []LogEntry
-	LeaderCommit                              int
-}
-type AppendEntriesReply struct {
-	Term          int
-	Success       bool
-	ConflictTerm  int
-	ConflictIndex int
-}
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+
+	SnapshotValid bool
+	Snapshot      []byte
+	SnapshotIndex int
+	SnapshotTerm  int
 }
 
 const (
@@ -89,6 +50,8 @@ type Raft struct {
 
 	replicatedConds []*sync.Cond
 	stopCh          chan struct{}
+
+	snapshot []byte
 }
 
 func NewRaft(me int, peers []*PeerClient, applyCh chan ApplyMsg, persister *Persister) (*Raft, error) {
@@ -114,7 +77,7 @@ func NewRaft(me int, peers []*PeerClient, applyCh chan ApplyMsg, persister *Pers
 		me:              me,
 		peers:           peers,
 		votedFor:        -1,
-		logs:            []LogEntry{{Term: 0}},
+		logs:            []LogEntry{{Index: 0, Term: 0}},
 		persister:       persister,
 		state:           Follower,
 		nextIndex:       make([]int, len(peers)),
@@ -164,443 +127,6 @@ func (rf *Raft) GetLogs() []LogEntry {
 	return append([]LogEntry(nil), rf.logs...)
 }
 
-func (rf *Raft) resetElectionTimerLocked() {
-	rf.electionDeadline = time.Now().Add(electionTimeoutMin + time.Duration(rand.Int63n(int64(electionTimeoutJitter))))
-}
-
-func (rf *Raft) becomeFollowerLocked(term int) {
-	if term < rf.currentTerm {
-		return
-	}
-
-	if term > rf.currentTerm {
-		rf.currentTerm = term
-		rf.votedFor = -1
-
-		rf.persistLocked()
-	}
-
-	rf.state = Follower
-}
-
-func (rf *Raft) lastLogInfoLocked() (int, int) {
-	i := len(rf.logs) - 1
-	return i, rf.logs[i].Term
-}
-
-func (rf *Raft) isLogUpToDateLocked(index, term int) bool {
-	i, t := rf.lastLogInfoLocked()
-	return term > t || (term == t && index >= i)
-}
-
-// handler
-func (rf *Raft) HandleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	reply.VoteGranted = false
-	defer func() {
-		reply.Term = rf.currentTerm
-	}()
-
-	if rf.killed() || args.Term < rf.currentTerm {
-		return
-	}
-
-	if args.Term > rf.currentTerm {
-		rf.becomeFollowerLocked(args.Term)
-	}
-
-	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.isLogUpToDateLocked(args.LastLogIndex, args.LastLogTerm) {
-		rf.votedFor = args.CandidateId
-		rf.persistLocked()
-
-		reply.VoteGranted = true
-		rf.resetElectionTimerLocked()
-	}
-}
-
-func (rf *Raft) HandleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	reply.Success = false
-	defer func() {
-		reply.Term = rf.currentTerm
-	}()
-
-	if rf.killed() || args.Term < rf.currentTerm {
-		return
-	}
-
-	rf.becomeFollowerLocked(args.Term)
-	rf.resetElectionTimerLocked()
-
-	if args.PrevLogIndex < 0 {
-		return
-	}
-
-	if args.PrevLogIndex >= len(rf.logs) {
-		reply.ConflictIndex = len(rf.logs)
-		reply.ConflictTerm = -1
-		return
-	}
-
-	if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-		index := args.PrevLogIndex
-		term := rf.logs[args.PrevLogIndex].Term
-
-		for index > 0 && term == rf.logs[index-1].Term {
-			index--
-		}
-
-		reply.ConflictTerm = term
-		reply.ConflictIndex = index
-		return
-	}
-
-	start := args.PrevLogIndex + 1
-	i := 0
-	for i < len(args.Entries) && start+i < len(rf.logs) && rf.logs[start+i].Term == args.Entries[i].Term {
-		i++
-	}
-
-	if i < len(args.Entries) {
-		rf.logs = append(rf.logs[:start+i], args.Entries[i:]...)
-		rf.persistLocked()
-	}
-
-	reply.Success = true
-	matched := args.PrevLogIndex + len(args.Entries)
-	commit := min(args.LeaderCommit, matched)
-	if commit > rf.commitIndex {
-		rf.commitIndex = commit
-		rf.applyCond.Signal()
-	}
-}
-
-// sender
-func (rf *Raft) SendRequestVote(id int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	p := rf.peers[id]
-	if p == nil {
-		return false
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
-	defer cancel()
-
-	result, err := p.RequestVote(ctx, args)
-	if err != nil {
-		return false
-	}
-	*reply = *result
-	return true
-}
-
-func (rf *Raft) SendAppendEntries(id int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	p := rf.peers[id]
-	if p == nil {
-		return false
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), rpcTimeout)
-	defer cancel()
-
-	result, err := p.AppendEntries(ctx, args)
-	if err != nil {
-		return false
-	}
-	*reply = *result
-	return true
-}
-
-func (rf *Raft) startElectionLocked() {
-	rf.currentTerm++
-	rf.state = Candidate
-	rf.votedFor = rf.me
-
-	rf.persistLocked()
-
-	rf.resetElectionTimerLocked()
-
-	term := rf.currentTerm
-	index, lastTerm := rf.lastLogInfoLocked()
-
-	votes := 1
-	majority := len(rf.peers)/2 + 1
-
-	if votes >= majority {
-		rf.becomeLeaderLocked()
-		return
-	}
-
-	args := RequestVoteArgs{
-		Term:         term,
-		CandidateId:  rf.me,
-		LastLogIndex: index,
-		LastLogTerm:  lastTerm,
-	}
-
-	for id := range rf.peers {
-		if id == rf.me {
-			continue
-		}
-
-		go func(server int) {
-			var reply RequestVoteReply
-
-			if !rf.SendRequestVote(server, &args, &reply) {
-				return
-			}
-
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-
-			if reply.Term > rf.currentTerm {
-				rf.becomeFollowerLocked(reply.Term)
-				return
-			}
-
-			if rf.state != Candidate || rf.currentTerm != term {
-				return
-			}
-
-			if reply.VoteGranted {
-				votes++
-				if votes >= majority {
-					rf.becomeLeaderLocked()
-				}
-			}
-		}(id)
-	}
-}
-
-func (rf *Raft) becomeLeaderLocked() {
-	if rf.state != Candidate {
-		return
-	}
-
-	rf.state = Leader
-	last, _ := rf.lastLogInfoLocked()
-	for id := range rf.peers {
-		rf.nextIndex[id] = last + 1
-		rf.matchIndex[id] = 0
-	}
-
-	rf.nextIndex[rf.me] = last + 1
-	rf.matchIndex[rf.me] = last
-
-	rf.signalReplicatorsLocked()
-	rf.lastHeartbeat = time.Now()
-	go rf.broadcastHeartbeat()
-}
-
-// replicate
-func (rf *Raft) needReplicating(peer int) bool {
-	return rf.state == Leader &&
-		rf.matchIndex[peer] < len(rf.logs)-1
-}
-
-func (rf *Raft) signalReplicatorsLocked() {
-	for peer, cond := range rf.replicatedConds {
-		if peer == rf.me {
-			continue
-		}
-
-		cond.Signal()
-	}
-}
-
-func (rf *Raft) replicator(peer int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	for !rf.killed() {
-		for !rf.killed() && !rf.needReplicating(peer) {
-			rf.replicatedConds[peer].Wait()
-		}
-
-		if rf.killed() {
-			return
-		}
-
-		rf.replicateOneRoundLocked(peer)
-	}
-}
-
-func (rf *Raft) replicateOneRoundLocked(server int) {
-	term := rf.currentTerm
-	next := rf.nextIndex[server]
-	prev := next - 1
-
-	args := AppendEntriesArgs{
-		Term:         term,
-		LeaderId:     rf.me,
-		PrevLogIndex: prev,
-		PrevLogTerm:  rf.logs[prev].Term,
-		Entries:      append([]LogEntry(nil), rf.logs[next:]...),
-		LeaderCommit: rf.commitIndex,
-	}
-
-	rf.mu.Unlock()
-
-	var reply AppendEntriesReply
-
-	ok := rf.SendAppendEntries(server, &args, &reply)
-	if !ok {
-		select {
-		case <-time.After(heartbeatInterval):
-		case <-rf.stopCh:
-		}
-	}
-
-	rf.mu.Lock()
-
-	if !ok || rf.killed() {
-		return
-	}
-
-	if reply.Term > rf.currentTerm {
-		rf.becomeFollowerLocked(reply.Term)
-		return
-	}
-
-	if rf.killed() || rf.state != Leader || rf.currentTerm != term {
-		return
-	}
-
-	if reply.Success {
-		matched := args.PrevLogIndex + len(args.Entries)
-
-		if matched > rf.matchIndex[server] {
-			rf.matchIndex[server] = matched
-		}
-
-		if matched+1 > rf.nextIndex[server] {
-			rf.nextIndex[server] = matched + 1
-		}
-		rf.updateCommitIndexLocked()
-
-		return
-	}
-
-	// if args.PrevLogIndex <= rf.matchIndex[server] || rf.nextIndex[server] != args.PrevLogIndex+1 {
-	// 	return
-	// }
-
-	next = reply.ConflictIndex
-	if reply.ConflictTerm != -1 {
-		for i := len(rf.logs) - 1; i >= 1; i-- {
-			if rf.logs[i].Term == reply.ConflictTerm {
-				next = i + 1
-				break
-			}
-		}
-	}
-
-	rf.nextIndex[server] = max(1, next)
-}
-
-func (rf *Raft) updateCommitIndexLocked() {
-	if rf.state != Leader {
-		return
-	}
-
-	majority := len(rf.peers)/2 + 1
-
-	for n := len(rf.logs) - 1; n > rf.commitIndex; n-- {
-		if rf.logs[n].Term != rf.currentTerm {
-			continue
-		}
-
-		count := 0
-		for _, matched := range rf.matchIndex {
-			if matched >= n {
-				count++
-			}
-		}
-
-		if count >= majority {
-			rf.commitIndex = n
-			rf.applyCond.Signal()
-			return
-		}
-	}
-}
-
-// heartbeat
-func (rf *Raft) broadcastHeartbeat() {
-	for peer := range rf.peers {
-		if peer == rf.me {
-			continue
-		}
-
-		go rf.sendHeartbeat(peer)
-	}
-}
-
-func (rf *Raft) sendHeartbeat(peer int) {
-	rf.mu.Lock()
-
-	if rf.killed() || rf.state != Leader {
-		rf.mu.Unlock()
-		return
-	}
-
-	term := rf.currentTerm
-	matched := rf.matchIndex[peer]
-
-	args := AppendEntriesArgs{
-		Term:         term,
-		LeaderId:     rf.me,
-		PrevLogIndex: matched,
-		PrevLogTerm:  rf.logs[matched].Term,
-		Entries:      nil,
-		LeaderCommit: rf.commitIndex,
-	}
-
-	rf.mu.Unlock()
-
-	var reply AppendEntriesReply
-	if !rf.SendAppendEntries(peer, &args, &reply) {
-		return
-	}
-
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	if reply.Term > rf.currentTerm {
-		rf.becomeFollowerLocked(reply.Term)
-		return
-	}
-}
-
-func (rf *Raft) ticker() {
-	t := time.NewTicker(10 * time.Millisecond)
-	defer t.Stop()
-	for {
-		select {
-		case <-rf.stopCh:
-			return
-		case <-t.C:
-		}
-
-		now := time.Now()
-		rf.mu.Lock()
-
-		if rf.state == Leader {
-			if now.Sub(rf.lastHeartbeat) >= heartbeatInterval {
-				rf.lastHeartbeat = now
-				rf.mu.Unlock()
-
-				rf.broadcastHeartbeat()
-				continue
-			}
-		} else if !now.Before(rf.electionDeadline) {
-			rf.startElectionLocked()
-		}
-		rf.mu.Unlock()
-	}
-}
-
 func (rf *Raft) applier() {
 	for {
 		rf.mu.Lock()
@@ -614,9 +140,11 @@ func (rf *Raft) applier() {
 		}
 
 		next := rf.lastApplied + 1
+		offset, _ := rf.indexToOffsetLocked(next)
+
 		msg := ApplyMsg{
 			CommandValid: true,
-			Command:      rf.logs[next].Command,
+			Command:      rf.logs[offset].Command,
 			CommandIndex: next,
 		}
 
@@ -629,7 +157,7 @@ func (rf *Raft) applier() {
 		}
 
 		rf.mu.Lock()
-		rf.lastApplied = next
+		rf.lastApplied = max(rf.lastApplied, next)
 		rf.mu.Unlock()
 	}
 }
@@ -643,9 +171,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return -1, term, false
 	}
 
-	rf.logs = append(rf.logs, LogEntry{Term: term, Command: command})
+	lastIndex := rf.lastIndexLocked()
+	index := lastIndex + 1
+	rf.logs = append(rf.logs, LogEntry{
+		Index:   index,
+		Term:    term,
+		Command: command,
+	})
 	rf.persistLocked()
-	index := len(rf.logs) - 1
+
 	rf.matchIndex[rf.me] = index
 	rf.nextIndex[rf.me] = index + 1
 
@@ -675,61 +209,4 @@ func (rf *Raft) Kill() {
 
 func (rf *Raft) killed() bool {
 	return atomic.LoadInt32(&rf.dead) == 1
-}
-
-// persist
-func (rf *Raft) persistLocked() {
-	var buf bytes.Buffer
-	enc := gob.NewEncoder(&buf)
-
-	if err := enc.Encode(rf.currentTerm); err != nil {
-		panic(err)
-	}
-	if err := enc.Encode(rf.votedFor); err != nil {
-		panic(err)
-	}
-	if err := enc.Encode(rf.logs); err != nil {
-		panic(err)
-	}
-
-	if err := rf.persister.SaveRaftState(buf.Bytes()); err != nil {
-		panic(fmt.Errorf("persist raft state: %w", err))
-	}
-}
-
-func (rf *Raft) readPersist() error {
-	data, err := rf.persister.ReadRaftState()
-	if err != nil {
-		return err
-	}
-
-	if len(data) == 0 {
-		return nil
-	}
-
-	dec := gob.NewDecoder(bytes.NewReader(data))
-
-	var term int
-	var votedFor int
-	var logs []LogEntry
-
-	if err := dec.Decode(&term); err != nil {
-		return err
-	}
-	if err := dec.Decode(&votedFor); err != nil {
-		return err
-	}
-	if err := dec.Decode(&logs); err != nil {
-		return err
-	}
-
-	if len(logs) == 0 || logs[0].Term != 0 {
-		return fmt.Errorf("invalid persisted raft log")
-	}
-
-	rf.currentTerm = term
-	rf.votedFor = votedFor
-	rf.logs = logs
-
-	return nil
 }

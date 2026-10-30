@@ -61,6 +61,7 @@ func (s *GRPCServer) AppendEntries(
 		}
 
 		entries = append(entries, LogEntry{
+			Index:   int(e.Index),
 			Term:    int(e.Term),
 			Command: command,
 		})
@@ -80,7 +81,31 @@ func (s *GRPCServer) AppendEntries(
 	s.rf.HandleAppendEntries(&args, &reply)
 
 	return &pb.AppendEntriesResponse{
-		Term:    int64(reply.Term),
-		Success: reply.Success,
+		Term:          int64(reply.Term),
+		Success:       reply.Success,
+		ConflictIndex: int64(reply.ConflictIndex),
+		ConflictTerm:  int64(reply.ConflictTerm),
+	}, nil
+}
+
+func (s *GRPCServer) InstallSnapshot(
+	_ context.Context,
+	req *pb.InstallSnapshotRequest,
+) (*pb.InstallSnapshotResponse, error) {
+
+	args := InstallSnapshotArgs{
+		Term:              int(req.Term),
+		LeaderId:          int(req.LeaderId),
+		LastIncludedIndex: int(req.LastIncludedIndex),
+		LastIncludedTerm:  int(req.LastIncludedTerm),
+		Data:              req.Data,
+	}
+
+	var reply InstallSnapshotReply
+
+	s.rf.HandleInstallSnapshot(&args, &reply)
+
+	return &pb.InstallSnapshotResponse{
+		Term: int64(reply.Term),
 	}, nil
 }

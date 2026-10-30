@@ -80,6 +80,7 @@ func (p *PeerClient) AppendEntries(
 		}
 
 		entries = append(entries, &pb.LogEntry{
+			Index:   int64(e.Index),
 			Term:    int64(e.Term),
 			Command: command,
 		})
@@ -100,7 +101,32 @@ func (p *PeerClient) AppendEntries(
 	}
 
 	return &AppendEntriesReply{
-		Term:    int(resp.Term),
-		Success: resp.Success,
+		Term:          int(resp.Term),
+		Success:       resp.Success,
+		ConflictIndex: int(resp.ConflictIndex),
+		ConflictTerm:  int(resp.ConflictTerm),
+	}, nil
+}
+
+func (p *PeerClient) InstallSnapshot(
+	ctx context.Context,
+	args *InstallSnapshotArgs,
+) (*InstallSnapshotReply, error) {
+
+	req := &pb.InstallSnapshotRequest{
+		Term:              int64(args.Term),
+		LeaderId:          int64(args.LeaderId),
+		LastIncludedIndex: int64(args.LastIncludedIndex),
+		LastIncludedTerm:  int64(args.LastIncludedTerm),
+		Data:              args.Data,
+	}
+
+	resp, err := p.client.InstallSnapshot(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	return &InstallSnapshotReply{
+		Term: int(resp.Term),
 	}, nil
 }
