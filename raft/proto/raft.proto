@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package raft;
 
-option go_package = "github.com/OrangeJuiceWithIce/raftkv/pb;pb";
+option go_package = "github.com/OrangeJuiceWithIce/raftkv/raft/pb;pb";
 
 service RaftService {
   rpc RequestVote(RequestVoteRequest)
